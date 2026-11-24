@@ -1,12 +1,4 @@
-"""Stretch goal: give the trained arm a goal in plain language.
-
-    python command_demo.py --model runs/.../best_model.zip --command "put the block up and to the left"
-
-The parser is a simple keyword rule. Swap `parse_command` for an intent/slot
-model (e.g. a fine-tuned BERT) or an ASR -> text pipeline to extend it.
-Axes assumed for Fetch: +x = away from the robot base, +y = left, +z = up.
-"""
-import argparse
+import sys
 
 import gymnasium as gym
 import gymnasium_robotics
@@ -15,50 +7,66 @@ from stable_baselines3 import SAC
 
 gym.register_envs(gymnasium_robotics)
 
-STEP = 0.12  # metres per direction word (target_range is 0.15)
+ENV_ID = "FetchPickAndPlace-v4"
+model_path = sys.argv[1] if len(sys.argv) > 1 else "best_model.zip"
+
+SIDE = 0.12    # metres left/right/forward/back (training range is +/-0.15)
+LIFT = 0.20    # metres above the table for "in the air"
 
 
-def parse_command(text: str) -> np.ndarray:
+def parse_command(text, center_xy, table_z):
     t = text.lower()
-    off = np.zeros(3)
+    x, y = center_xy
+    z = table_z
     if "left" in t:
-        off[1] += STEP
+        y += SIDE
     if "right" in t:
-        off[1] -= STEP
-    if "forward" in t or "far" in t:
-        off[0] += STEP
-    if "back" in t or "near" in t:
-        off[0] -= STEP
-    if "up" in t or "lift" in t or "high" in t:
-        off[2] += STEP
-    return off
+        y -= SIDE
+    if "forward" in t or "front" in t or "far" in t:
+        x += SIDE
+    if "back" in t or "near" in t or "close" in t:
+        x -= SIDE
+    if any(w in t for w in ("up", "lift", "high", "air", "raise", "hold")):
+        z = table_z + LIFT
+    if "very high" in t or "highest" in t:
+        z = table_z + 0.35
+    return np.array([x, y, z])
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True)
-    p.add_argument("--command", required=True)
-    p.add_argument("--env", default="FetchPickAndPlace-v4")
-    args = p.parse_args()
+env = gym.make(ENV_ID, render_mode="human")
+model = SAC.load(
+    model_path,
+    custom_objects={"replay_buffer_class": None, "replay_buffer_kwargs": {}, "buffer_size": 1},
+)
 
-    env = gym.make(args.env, render_mode="human")
-    model = SAC.load(args.model)
+print("Type a command, for example:")
+print("  put the block on the table to the left")
+print("  lift the block high in the middle")
+print("  place it forward and to the right")
+print("  hold it up and back")
+print("Type 'quit' to exit.\n")
+
+obs, _ = env.reset()
+while True:
+    text = input("command> ").strip()
+    if text.lower() in ("quit", "exit", "q"):
+        break
+    if not text:
+        continue
+
     obs, _ = env.reset()
-
     base = env.unwrapped
-    goal = base.initial_gripper_xpos[:3] + parse_command(args.command)
-    goal[2] = max(goal[2], base.initial_gripper_xpos[2] - 0.05)  # keep above table
+    table_z = getattr(base, "height_offset", 0.42)
+    goal = parse_command(text, base.initial_gripper_xpos[:2], table_z)
     base.goal = goal
     obs = base._get_obs()
-    print("Goal set to", np.round(goal, 3))
+    print("target set to", np.round(goal, 3))
 
     done, info = False, {}
     while not done:
         action, _ = model.predict(obs, deterministic=True)
         obs, _, terminated, truncated, info = env.step(action)
         done = terminated or truncated
-    print("Success:", bool(info.get("is_success", 0)))
+    print("success:", bool(info.get("is_success", 0)), "\n")
 
-
-if __name__ == "__main__":
-    main()
+env.close()
